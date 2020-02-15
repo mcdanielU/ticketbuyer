@@ -5,12 +5,10 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"github.com/decred/dcrd/txscript/v2"
-	"github.com/decred/dcrd/wire"
-	"github.com/decred/dcrwallet/wallet/v3/txrules"
+
 	"io/ioutil"
 	"net"
 	"net/http"
@@ -22,12 +20,24 @@ import (
 	"github.com/decred/dcrd/chaincfg/chainhash"
 	"github.com/decred/dcrd/dcrjson/v3"
 	"github.com/decred/dcrd/dcrutil/v2"
+	"github.com/decred/dcrd/txscript/v2"
+	"github.com/decred/dcrd/wire"
+	"github.com/decred/dcrwallet/errors/v2"
 	wallettypes "github.com/decred/dcrwallet/rpc/jsonrpc/types"
 	pb "github.com/decred/dcrwallet/rpc/walletrpc"
+	"github.com/decred/dcrwallet/wallet/v3/txauthor"
+	"github.com/decred/dcrwallet/wallet/v3/txrules"
+	"github.com/decred/dcrwallet/wallet/v3/txsizes"
+)
+
+const (
+	generatedTxVersion uint16 = 1
 )
 
 var (
+	// fees are in dcr per kb
 	ticketFeeRelayDCR dcrutil.Amount
+	txRelayFeeDCR     dcrutil.Amount
 )
 
 type TicketBuyer struct {
@@ -68,16 +78,16 @@ func (tb *TicketBuyer) connect() error {
 	tb.conn = conn
 	tb.walletService = walletService
 
-	err = tb.updateTicketFee()
+	err = tb.updateTicketRelayFee()
 	if err != nil {
 		return err
 	}
 
-	return nil
+	return tb.updateTransactionRelayFee()
 }
 
 func (tb *TicketBuyer) disconnect() error {
-	if tb.conn == nil{
+	if tb.conn == nil {
 		return errors.New("no active connection")
 	}
 	return tb.conn.Close()
@@ -99,7 +109,7 @@ func (tb *TicketBuyer) printBalance() error {
 	return nil
 }
 
-func (tb *TicketBuyer) updateTicketFee() error {
+func (tb *TicketBuyer) updateTicketRelayFee() error {
 	ticketFeeCmd := wallettypes.NewGetTicketFeeCmd()
 	marshalledJSON, err := dcrjson.MarshalCmd(rpcVersion, 1, ticketFeeCmd)
 	if err != nil {
@@ -118,6 +128,32 @@ func (tb *TicketBuyer) updateTicketFee() error {
 	}
 
 	ticketFeeRelayDCR, err = dcrutil.NewAmount(relayFee)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (tb *TicketBuyer) updateTransactionRelayFee() error {
+	walletFeeCmd := wallettypes.NewGetWalletFeeCmd()
+	marshalledJSON, err := dcrjson.MarshalCmd(rpcVersion, 1, walletFeeCmd)
+	if err != nil {
+		return err
+	}
+
+	resp, err := tb.sendPostRequest(marshalledJSON)
+	if err != nil {
+		return err
+	}
+
+	var relayFee float64
+	err = json.Unmarshal(resp.Result, &relayFee)
+	if err != nil {
+		return err
+	}
+
+	txRelayFeeDCR, err = dcrutil.NewAmount(relayFee)
 	if err != nil {
 		return err
 	}
@@ -160,7 +196,7 @@ func (tb *TicketBuyer) listenForBlockNotifications() error {
 	select {}
 }
 
-func (tb *TicketBuyer) generateAddress(internal bool) (dcrutil.Address, error) {
+func (tb *TicketBuyer) generateAddress(internal bool) (address dcrutil.Address, pkScript []byte, err error) {
 	ctx := context.Background()
 	addressRequest := &pb.NextAddressRequest{
 		Account:   0,
@@ -174,15 +210,16 @@ func (tb *TicketBuyer) generateAddress(internal bool) (dcrutil.Address, error) {
 
 	addressResponse, err := tb.walletService.NextAddress(ctx, addressRequest)
 	if err != nil {
-		return nil, err
+		return
 	}
 
-	decoded, err := dcrutil.DecodeAddress(addressResponse.Address, tb.netParams)
+	address, err = dcrutil.DecodeAddress(addressResponse.Address, tb.netParams)
 	if err != nil {
-		return nil, err
+		return
 	}
 
-	return decoded, nil
+	pkScript, _, err = addressScript(address)
+	return
 }
 
 func (tb *TicketBuyer) getTicketPrice() (dcrutil.Amount, error) {
@@ -197,19 +234,18 @@ func (tb *TicketBuyer) getTicketPrice() (dcrutil.Amount, error) {
 
 func (tb *TicketBuyer) purchaseTicket() error {
 
-	tb.printUnspentInputs()
+	tb.printUnspentOutputs()
 	ticketPrice, err := tb.getTicketPrice()
 	if err != nil {
 		return err
 	}
 
-	ctx := context.Background()
-	votingAddress, err := tb.generateAddress(true)
+	votingAddress, _, err := tb.generateAddress(true)
 	if err != nil {
 		return err
 	}
 
-	estTxSize := tb.estimateTicketSize(votingAddress)
+	estTxSize := estimateTicketSize(votingAddress)
 	ticketFee := txrules.FeeForSerializeSize(ticketFeeRelayDCR, estTxSize)
 	fmt.Printf("Ticket Fee: %s\n", ticketFee)
 	totalTicketCost := ticketPrice + ticketFee
@@ -251,7 +287,7 @@ func (tb *TicketBuyer) purchaseTicket() error {
 
 	fmt.Printf("Value out: %s\n", dcrutil.Amount(sstxOut.Value))
 
-	sstxCommitmentAddr, err := tb.generateAddress(true)
+	sstxCommitmentAddr, _, err := tb.generateAddress(true)
 	if err != nil {
 		return err
 	}
@@ -268,7 +304,7 @@ func (tb *TicketBuyer) purchaseTicket() error {
 	}
 	mtx.AddTxOut(sstxCommitmentTxOut)
 
-	sstxChangeAddr, err := tb.generateAddress(true)
+	sstxChangeAddr, _, err := tb.generateAddress(true)
 	if err != nil {
 		return err
 	}
@@ -295,7 +331,7 @@ func (tb *TicketBuyer) purchaseTicket() error {
 		return err
 	}
 
-	hash, err := tb.signAndPublishTransaction(ctx, tb.walletService, serializedTx)
+	hash, err := tb.signAndPublishTransaction(serializedTx)
 	if err != nil {
 		return err
 	}
@@ -305,113 +341,216 @@ func (tb *TicketBuyer) purchaseTicket() error {
 	return nil
 }
 
-func (tb *TicketBuyer) printUnspentInputs() error {
+func (tb *TicketBuyer) listUnspentOutputs() ([]wallettypes.ListUnspentResult, error) {
 	minConfs := requiredConfirmations
 	unspentCmd := wallettypes.NewListUnspentCmd(&minConfs, nil, nil)
 	marshalledJSON, err := dcrjson.MarshalCmd(rpcVersion, 1, unspentCmd)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	resp, err := tb.sendPostRequest(marshalledJSON)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	var unspentInputs []wallettypes.ListUnspentResult
-	err = json.Unmarshal(resp.Result, &unspentInputs)
+	var unspentOutputs []wallettypes.ListUnspentResult
+	err = json.Unmarshal(resp.Result, &unspentOutputs)
 	if err != nil {
-		fmt.Println("Erroring here")
+		return nil, err
+	}
+
+	return unspentOutputs, nil
+}
+
+func (tb *TicketBuyer) printUnspentOutputs() error {
+
+	unspentOutputs, err := tb.listUnspentOutputs()
+	if err != nil {
 		return err
 	}
 
-	fmt.Println("Unspent inputs")
-	for _, unspentInput := range unspentInputs {
-		fmt.Printf("%s:%d Spendable: %t Amount: %f DCR\n", unspentInput.TxID, unspentInput.Vout, unspentInput.Spendable, unspentInput.Amount)
+	fmt.Println("Unspent Outputs")
+	for _, unspentOutput := range unspentOutputs {
+		fmt.Printf("%s:%d Spendable: %t Amount: %f DCR\n", unspentOutput.TxID, unspentOutput.Vout, unspentOutput.Spendable, unspentOutput.Amount)
 	}
 
 	return nil
 }
 
-func (tb *TicketBuyer) estimateTicketSize(votingAddress dcrutil.Address) int {
+func (tb *TicketBuyer) selectInputsForAmount(targetAmount dcrutil.Amount) (*txauthor.InputDetail, error) {
+	unspentOutputs, err := tb.listUnspentOutputs()
+	if err != nil {
+		return nil, err
+	}
 
-	inSizes := []int{RedeemP2PKHSigScriptSize}
+	var (
+		currentTotal      dcrutil.Amount
+		currentInputs     []*wire.TxIn
+		currentScripts    [][]byte
+		redeemScriptSizes []int
+	)
 
-	outSizes := []int{P2PKHPkScriptSize + 1,
-		TicketCommitmentScriptSize, P2PKHPkScriptSize + 1}
+	for _, unspentOutput := range unspentOutputs {
+		if unspentOutput.Spendable {
+			unspentOutputAmount, err := dcrutil.NewAmount(unspentOutput.Amount)
+			if err != nil {
+				return nil, err
+			}
 
-	estSize := EstimateSerializeSizeFromScriptSizes(inSizes, outSizes, 0)
+			txHash, err := chainhash.NewHashFromStr(unspentOutput.TxID)
+			if err != nil {
+				return nil, err
+			}
 
-	fmt.Printf("Estimated Size: %d\n", estSize)
+			txInOutpoint := wire.NewOutPoint(txHash, unspentOutput.Vout, unspentOutput.Tree)
+			txIn := wire.NewTxIn(txInOutpoint, int64(unspentOutputAmount), nil)
 
-	return estSize
+			pkScript, err := hex.DecodeString(unspentOutput.ScriptPubKey)
+			if err != nil {
+				return nil, err
+			}
+
+			scriptClass := txscript.GetScriptClass(0, pkScript)
+			var scriptSize int
+
+			switch scriptClass {
+			case txscript.PubKeyHashTy:
+				scriptSize = txsizes.RedeemP2PKHSigScriptSize
+			case txscript.PubKeyTy:
+				scriptSize = txsizes.RedeemP2PKSigScriptSize
+			case txscript.StakeRevocationTy, txscript.StakeSubChangeTy, txscript.StakeGenTy:
+				scriptClass, err = txscript.GetStakeOutSubclass(pkScript)
+				if err != nil {
+					return nil, errors.Errorf(
+						"failed to extract nested script in stake output: %v",
+						err)
+				}
+
+				// For stake transactions we expect P2PKH and P2SH script class
+				// types only but ignore P2SH script type since it can pay
+				// to any script which the wallet may not recognize.
+				if scriptClass != txscript.PubKeyHashTy {
+					fmt.Printf("unexpected nested script class for credit: %v\n",
+						scriptClass)
+					continue
+				}
+
+				scriptSize = txsizes.RedeemP2PKHSigScriptSize
+			default:
+				fmt.Printf("unexpected script class for credit: %v\n",
+					scriptClass)
+				continue
+			}
+
+			currentTotal += unspentOutputAmount
+			currentInputs = append(currentInputs, txIn)
+			currentScripts = append(currentScripts, pkScript)
+			redeemScriptSizes = append(redeemScriptSizes, scriptSize)
+
+			if currentTotal >= targetAmount {
+				return &txauthor.InputDetail{
+					Amount:            currentTotal,
+					Inputs:            currentInputs,
+					Scripts:           currentScripts,
+					RedeemScriptSizes: redeemScriptSizes,
+				}, nil
+			}
+		}
+	}
+
+	return nil, errors.E(errors.InsufficientBalance)
 }
 
 func (tb *TicketBuyer) sendFundingTx(ticketCost dcrutil.Amount) (*wire.MsgTx, error) {
 
-	// mtx := wire.NewMsgTx()
-	ctx := context.Background()
+	mtx := wire.NewMsgTx()
 
-	fundingTxAddress, err := tb.generateAddress(true)
+	_, outputScript, err := tb.generateAddress(true)
 	if err != nil {
 		return nil, err
 	}
+	txOut := wire.NewTxOut(int64(ticketCost), outputScript)
+	mtx.AddTxOut(txOut)
 
-	nonchangeOutputs := make([]*pb.ConstructTransactionRequest_Output, 1)
-	nonchangeOutputs[0] = &pb.ConstructTransactionRequest_Output{
-		Amount: int64(ticketCost),
-		Destination: &pb.ConstructTransactionRequest_OutputDestination{
-			Address: fundingTxAddress.Address(),
-		},
-	}
-
-	constructTransactionRequest := &pb.ConstructTransactionRequest{
-		SourceAccount:            accountNumber,
-		RequiredConfirmations:    requiredConfirmations,
-		OutputSelectionAlgorithm: pb.ConstructTransactionRequest_UNSPECIFIED,
-		NonChangeOutputs:         nonchangeOutputs,
-	}
-
-	constructTransactionResponse, err := tb.walletService.ConstructTransaction(ctx, constructTransactionRequest)
+	_, changeAddressScript, err := tb.generateAddress(true)
 	if err != nil {
 		return nil, err
 	}
+	changeScriptSize := txsizes.P2PKHPkScriptSize
 
-	signTransactionRequest := &pb.SignTransactionRequest{
-		Passphrase:            []byte("c"),
-		SerializedTransaction: constructTransactionResponse.UnsignedTransaction,
+	// init'd with a single script for inital tx fee estimation
+	scriptSizes := []int{txsizes.RedeemP2PKHSigScriptSize}
+
+	maxSignedSize := txsizes.EstimateSerializeSize(scriptSizes, mtx.TxOut, changeScriptSize)
+	targetFee := txrules.FeeForSerializeSize(txRelayFeeDCR, maxSignedSize)
+
+	for {
+		inputDetail, err := tb.selectInputsForAmount(ticketCost + targetFee)
+		if err != nil {
+			return nil, err
+		}
+
+		if inputDetail.Amount < ticketCost+targetFee {
+			return nil, errors.E(errors.InsufficientBalance)
+		}
+
+		scriptSizes := make([]int, 0, len(inputDetail.RedeemScriptSizes))
+		scriptSizes = append(scriptSizes, inputDetail.RedeemScriptSizes...)
+
+		maxSignedSize = txsizes.EstimateSerializeSize(scriptSizes, mtx.TxOut, changeScriptSize)
+		maxRequiredFee := txrules.FeeForSerializeSize(txRelayFeeDCR, maxSignedSize)
+		remainingAmount := inputDetail.Amount - ticketCost
+		if remainingAmount < maxRequiredFee {
+			targetFee = maxRequiredFee
+			continue
+		}
+
+		mtx.TxIn = inputDetail.Inputs
+		mtx.SerType = wire.TxSerializeFull
+		mtx.Version = generatedTxVersion
+
+		changeAmount := inputDetail.Amount - ticketCost - maxRequiredFee
+		if changeAmount != 0 && !txrules.IsDustAmount(changeAmount, changeScriptSize, txRelayFeeDCR) {
+
+			if len(changeAddressScript) > txscript.MaxScriptElementSize {
+				return nil, errors.E(errors.Invalid, "script size exceed maximum bytes "+
+					"pushable to the stack")
+			}
+
+			change := &wire.TxOut{
+				Value:    int64(changeAmount),
+				PkScript: changeAddressScript,
+			}
+
+			mtx.AddTxOut(change)
+		}
+
+		serializedTx, err := mtx.Bytes()
+		if err != nil {
+			return nil, err
+		}
+
+		hash, err := tb.signAndPublishTransaction(serializedTx)
+		if err != nil {
+			return nil, err
+		}
+
+		fmt.Printf("Published Funding Tx: %s\n", hash)
+
+		return mtx, nil
 	}
 
-	signTransactionResponse, err := tb.walletService.SignTransaction(ctx, signTransactionRequest)
-	if err != nil {
-		return nil, err
-	}
-
-	publishTransactionRequest := &pb.PublishTransactionRequest{
-		SignedTransaction: signTransactionResponse.Transaction,
-	}
-
-	_, err = tb.walletService.PublishTransaction(ctx, publishTransactionRequest)
-	if err != nil {
-		return nil, err
-	}
-
-	var mtx wire.MsgTx
-	err = mtx.Deserialize(bytes.NewReader(signTransactionResponse.Transaction))
-	if err != nil {
-		return nil, err
-	}
-
-	return &mtx, nil
 }
 
-func (tb *TicketBuyer) signAndPublishTransaction(ctx context.Context, walletService pb.WalletServiceClient, serializedTx []byte) (hash *chainhash.Hash, err error) {
+func (tb *TicketBuyer) signAndPublishTransaction(serializedTx []byte) (hash *chainhash.Hash, err error) {
+	ctx := context.Background()
 	signTransactionRequest := &pb.SignTransactionRequest{
 		Passphrase:            []byte("c"),
 		SerializedTransaction: serializedTx,
 	}
 
-	signTransactionResponse, err := walletService.SignTransaction(ctx, signTransactionRequest)
+	signTransactionResponse, err := tb.walletService.SignTransaction(ctx, signTransactionRequest)
 	if err != nil {
 		return
 	}
@@ -420,7 +559,7 @@ func (tb *TicketBuyer) signAndPublishTransaction(ctx context.Context, walletServ
 		SignedTransaction: signTransactionResponse.Transaction,
 	}
 
-	publishTransactionResponse, err := walletService.PublishTransaction(ctx, publishTransactionRequest)
+	publishTransactionResponse, err := tb.walletService.PublishTransaction(ctx, publishTransactionRequest)
 	if err != nil {
 		return
 	}
