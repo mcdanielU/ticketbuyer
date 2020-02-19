@@ -13,8 +13,6 @@ const (
 	// fee limits imposed on a ticket.
 	defaultTicketFeeLimits = 0x5800
 
-	numTickets            = 1
-	defaultExpiry         = int32(0)
 	requiredConfirmations = 0
 	accountNumber         = 0 // default account
 	rpcVersion            = "1.0"

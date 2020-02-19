@@ -3,12 +3,12 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-
 	"io/ioutil"
 	"net"
 	"net/http"
@@ -16,8 +16,12 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 
+	"decred.org/cspp"
+	"decred.org/cspp/coinjoin"
 	"github.com/decred/dcrd/blockchain/stake/v2"
 	"github.com/decred/dcrd/chaincfg/chainhash"
+	"github.com/decred/dcrd/chaincfg/v2"
+	"github.com/decred/dcrd/chaincfg/v2/chainec"
 	"github.com/decred/dcrd/dcrjson/v3"
 	"github.com/decred/dcrd/dcrutil/v2"
 	"github.com/decred/dcrd/txscript/v2"
@@ -32,6 +36,10 @@ import (
 
 const (
 	generatedTxVersion uint16 = 1
+	defaultLockTime    uint32 = 0
+	defaultExpiry      uint32 = 0
+
+	csppserver = "cspp.decred.org:15760"
 )
 
 var (
@@ -46,15 +54,17 @@ type TicketBuyer struct {
 	conn            *grpc.ClientConn
 	walletService   pb.WalletServiceClient
 
-	netParams dcrutil.AddressParams
+	netParams     *chaincfg.Params
+	addressParams dcrutil.AddressParams
 }
 
-func NewTicketBuyer(host, certificateFile string, netParams dcrutil.AddressParams) *TicketBuyer {
+func NewTicketBuyer(host, certificateFile string, netParams *chaincfg.Params) *TicketBuyer {
 
 	return &TicketBuyer{
 		host:            host,
 		certificateFile: certificateFile,
 		netParams:       netParams,
+		addressParams:   chaincfg.TestNet3Params(),
 	}
 }
 
@@ -105,18 +115,13 @@ func (tb *TicketBuyer) printBalance() error {
 		return err
 	}
 	spendableBal := dcrutil.Amount(balanceResponse.Spendable)
-	fmt.Println("Spendable balance:", spendableBal)
+	log.Info("Spendable balance:", spendableBal)
 	return nil
 }
 
 func (tb *TicketBuyer) updateTicketRelayFee() error {
 	ticketFeeCmd := wallettypes.NewGetTicketFeeCmd()
-	marshalledJSON, err := dcrjson.MarshalCmd(rpcVersion, 1, ticketFeeCmd)
-	if err != nil {
-		return err
-	}
-
-	resp, err := tb.sendPostRequest(marshalledJSON)
+	resp, err := tb.sendPostRequest(ticketFeeCmd)
 	if err != nil {
 		return err
 	}
@@ -137,12 +142,7 @@ func (tb *TicketBuyer) updateTicketRelayFee() error {
 
 func (tb *TicketBuyer) updateTransactionRelayFee() error {
 	walletFeeCmd := wallettypes.NewGetWalletFeeCmd()
-	marshalledJSON, err := dcrjson.MarshalCmd(rpcVersion, 1, walletFeeCmd)
-	if err != nil {
-		return err
-	}
-
-	resp, err := tb.sendPostRequest(marshalledJSON)
+	resp, err := tb.sendPostRequest(walletFeeCmd)
 	if err != nil {
 		return err
 	}
@@ -168,7 +168,7 @@ func (tb *TicketBuyer) listenForBlockNotifications() error {
 		return err
 	}
 
-	fmt.Println("Listening for block notifcations")
+	log.Info("Listening for block notifcations")
 	for {
 		notificationResponse, err := notifiationClient.Recv()
 		if err != nil {
@@ -185,7 +185,7 @@ func (tb *TicketBuyer) listenForBlockNotifications() error {
 		}
 
 		numAttachedBlocks := len(notificationResponse.AttachedBlocks)
-		fmt.Printf("%d block(s) attached, Ticket Price: %s\n", numAttachedBlocks, ticketPrice)
+		log.Infof("%d block(s) attached, Ticket Price: %s", numAttachedBlocks, ticketPrice)
 
 		err = tb.purchaseTicket()
 		if err != nil {
@@ -222,6 +222,27 @@ func (tb *TicketBuyer) generateAddress(internal bool) (address dcrutil.Address, 
 	return
 }
 
+func (tb *TicketBuyer) privateKeyForAddress(address dcrutil.Address) (chainec.PrivateKey, error) {
+	dumpPrivCmd := wallettypes.NewDumpPrivKeyCmd(address.Address())
+	resp, err := tb.sendPostRequest(dumpPrivCmd)
+	if err != nil {
+		return nil, err
+	}
+
+	var wifPrivKey string
+	err = json.Unmarshal(resp.Result, &wifPrivKey)
+	if err != nil {
+		return nil, err
+	}
+
+	wif, err := dcrutil.DecodeWIF(wifPrivKey, tb.netParams.PrivateKeyID)
+	if err != nil {
+		return nil, err
+	}
+
+	return wif.PrivKey, nil
+}
+
 func (tb *TicketBuyer) getTicketPrice() (dcrutil.Amount, error) {
 	ctx := context.Background()
 	ticketPriceResponse, err := tb.walletService.TicketPrice(ctx, &pb.TicketPriceRequest{})
@@ -247,22 +268,20 @@ func (tb *TicketBuyer) purchaseTicket() error {
 
 	estTxSize := estimateTicketSize(votingAddress)
 	ticketFee := txrules.FeeForSerializeSize(ticketFeeRelayDCR, estTxSize)
-	fmt.Printf("Ticket Fee: %s\n", ticketFee)
+	log.Infof("Ticket Fee: %s", ticketFee)
 	totalTicketCost := ticketPrice + ticketFee
 
-	fundingTx, err := tb.sendFundingTx(totalTicketCost)
+	fundingTx, outputIndexes, err := tb.sendFundingTx(totalTicketCost)
 	if err != nil {
 		return err
 	}
 
-	fmt.Printf("Funding Tx Hash: %s\n", fundingTx.TxHash())
+	log.Infof("Funding Tx Hash: %s", fundingTx.TxHash())
 
-	fundingOutputIndex := -1
-	for index, output := range fundingTx.TxOut {
-		if output.Value == int64(totalTicketCost) {
-			fmt.Printf("Output Value: %s, Cost Equal: %v\n", dcrutil.Amount(output.Value), output.Value == int64(totalTicketCost))
-			fundingOutputIndex = index
-		}
+	fundingOutputIndex := outputIndexes[0]
+	if fundingOutputIndex != -1 { // Todo: Remove this block
+		output := fundingTx.TxOut[fundingOutputIndex]
+		log.Infof("Output Value: %s, Cost Equal: %v", dcrutil.Amount(output.Value), output.Value == int64(totalTicketCost))
 	}
 
 	if fundingOutputIndex == -1 {
@@ -276,7 +295,7 @@ func (tb *TicketBuyer) purchaseTicket() error {
 	txIn := wire.NewTxIn(txInOutpoint, int64(totalTicketCost), []byte{})
 	mtx.AddTxIn(txIn)
 
-	fmt.Printf("Value in: %s\n", dcrutil.Amount(txIn.ValueIn))
+	log.Infof("Value in: %s", dcrutil.Amount(txIn.ValueIn))
 
 	sstxPkScript, err := txscript.PayToSStx(votingAddress)
 	if err != nil {
@@ -285,7 +304,7 @@ func (tb *TicketBuyer) purchaseTicket() error {
 	sstxOut := wire.NewTxOut(int64(ticketPrice), sstxPkScript)
 	mtx.AddTxOut(sstxOut)
 
-	fmt.Printf("Value out: %s\n", dcrutil.Amount(sstxOut.Value))
+	log.Infof("Value out: %s", dcrutil.Amount(sstxOut.Value))
 
 	sstxCommitmentAddr, _, err := tb.generateAddress(true)
 	if err != nil {
@@ -322,7 +341,7 @@ func (tb *TicketBuyer) purchaseTicket() error {
 	mtx.AddTxOut(sstxChangeTxOut)
 
 	if err = stake.CheckSStx(mtx); err != nil {
-		fmt.Printf("Error generate ticket transaction: %v\n", err)
+		log.Infof("Error generate ticket transaction: %v", err)
 		return err
 	}
 
@@ -336,7 +355,7 @@ func (tb *TicketBuyer) purchaseTicket() error {
 		return err
 	}
 
-	fmt.Printf("Tx Hash: %s", hash.String())
+	log.Infof("Tx Hash: %s", hash.String())
 
 	return nil
 }
@@ -344,12 +363,7 @@ func (tb *TicketBuyer) purchaseTicket() error {
 func (tb *TicketBuyer) listUnspentOutputs() ([]wallettypes.ListUnspentResult, error) {
 	minConfs := requiredConfirmations
 	unspentCmd := wallettypes.NewListUnspentCmd(&minConfs, nil, nil)
-	marshalledJSON, err := dcrjson.MarshalCmd(rpcVersion, 1, unspentCmd)
-	if err != nil {
-		return nil, err
-	}
-
-	resp, err := tb.sendPostRequest(marshalledJSON)
+	resp, err := tb.sendPostRequest(unspentCmd)
 	if err != nil {
 		return nil, err
 	}
@@ -370,9 +384,9 @@ func (tb *TicketBuyer) printUnspentOutputs() error {
 		return err
 	}
 
-	fmt.Println("Unspent Outputs")
+	log.Info("Unspent Outputs")
 	for _, unspentOutput := range unspentOutputs {
-		fmt.Printf("%s:%d Spendable: %t Amount: %f DCR\n", unspentOutput.TxID, unspentOutput.Vout, unspentOutput.Spendable, unspentOutput.Amount)
+		log.Infof("%s:%d Spendable: %t Amount: %f DCR", unspentOutput.TxID, unspentOutput.Vout, unspentOutput.Spendable, unspentOutput.Amount)
 	}
 
 	return nil
@@ -431,14 +445,14 @@ func (tb *TicketBuyer) selectInputsForAmount(targetAmount dcrutil.Amount) (*txau
 				// types only but ignore P2SH script type since it can pay
 				// to any script which the wallet may not recognize.
 				if scriptClass != txscript.PubKeyHashTy {
-					fmt.Printf("unexpected nested script class for credit: %v\n",
+					log.Infof("unexpected nested script class for credit: %v",
 						scriptClass)
 					continue
 				}
 
 				scriptSize = txsizes.RedeemP2PKHSigScriptSize
 			default:
-				fmt.Printf("unexpected script class for credit: %v\n",
+				log.Infof("unexpected script class for credit: %v",
 					scriptClass)
 				continue
 			}
@@ -462,20 +476,20 @@ func (tb *TicketBuyer) selectInputsForAmount(targetAmount dcrutil.Amount) (*txau
 	return nil, errors.E(errors.InsufficientBalance)
 }
 
-func (tb *TicketBuyer) sendFundingTx(ticketCost dcrutil.Amount) (*wire.MsgTx, error) {
+func (tb *TicketBuyer) sendFundingTx(ticketCost dcrutil.Amount) (*wire.MsgTx, []int, error) {
 
 	mtx := wire.NewMsgTx()
 
 	_, outputScript, err := tb.generateAddress(true)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	txOut := wire.NewTxOut(int64(ticketCost), outputScript)
 	mtx.AddTxOut(txOut)
 
 	_, changeAddressScript, err := tb.generateAddress(true)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	changeScriptSize := txsizes.P2PKHPkScriptSize
 
@@ -488,11 +502,11 @@ func (tb *TicketBuyer) sendFundingTx(ticketCost dcrutil.Amount) (*wire.MsgTx, er
 	for {
 		inputDetail, err := tb.selectInputsForAmount(ticketCost + targetFee)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 
 		if inputDetail.Amount < ticketCost+targetFee {
-			return nil, errors.E(errors.InsufficientBalance)
+			return nil, nil, errors.E(errors.InsufficientBalance)
 		}
 
 		scriptSizes := make([]int, 0, len(inputDetail.RedeemScriptSizes))
@@ -511,14 +525,15 @@ func (tb *TicketBuyer) sendFundingTx(ticketCost dcrutil.Amount) (*wire.MsgTx, er
 		mtx.Version = generatedTxVersion
 
 		changeAmount := inputDetail.Amount - ticketCost - maxRequiredFee
+		var change *wire.TxOut
 		if changeAmount != 0 && !txrules.IsDustAmount(changeAmount, changeScriptSize, txRelayFeeDCR) {
 
 			if len(changeAddressScript) > txscript.MaxScriptElementSize {
-				return nil, errors.E(errors.Invalid, "script size exceed maximum bytes "+
+				return nil, nil, errors.E(errors.Invalid, "script size exceed maximum bytes "+
 					"pushable to the stack")
 			}
 
-			change := &wire.TxOut{
+			change = &wire.TxOut{
 				Value:    int64(changeAmount),
 				PkScript: changeAddressScript,
 			}
@@ -526,19 +541,37 @@ func (tb *TicketBuyer) sendFundingTx(ticketCost dcrutil.Amount) (*wire.MsgTx, er
 			mtx.AddTxOut(change)
 		}
 
-		serializedTx, err := mtx.Bytes()
-		if err != nil {
-			return nil, err
+		ctx := context.Background()
+
+		pairing := coinjoin.EncodeDesc(coinjoin.P2PKHv0, int64(ticketCost), generatedTxVersion, defaultLockTime, defaultExpiry)
+		cj := tb.newCsppJoin(ctx, change, ticketCost)
+		for i, in := range mtx.TxIn {
+			cj.addTxIn(inputDetail.Scripts[i], in)
 		}
 
-		hash, err := tb.signAndPublishTransaction(serializedTx)
+		csppSession, err := cspp.NewSession(rand.Reader, infoLog, pairing, 1)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 
-		fmt.Printf("Published Funding Tx: %s\n", hash)
+		conn, err := tls.Dial("tcp", csppserver, nil)
+		if err != nil {
+			return nil, nil, err
+		}
+		defer conn.Close()
 
-		return mtx, nil
+		log.Infof("Dialed CSPPServer %v -> %v", conn.LocalAddr(), conn.RemoteAddr())
+		err = csppSession.DiceMix(ctx, conn, cj)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		mixedTx := cj.tx
+		splitTxHash := mixedTx.TxHash()
+
+		log.Infof("Published Funding Tx: %s, Indexes: %v", splitTxHash, cj.mixOutputIndexes())
+
+		return mixedTx, cj.mixOutputIndexes(), nil
 	}
 
 }
@@ -564,7 +597,7 @@ func (tb *TicketBuyer) signAndPublishTransaction(serializedTx []byte) (hash *cha
 		return
 	}
 
-	fmt.Println("Transaction published")
+	log.Info("Transaction published")
 
 	hash, err = chainhash.NewHash(publishTransactionResponse.TransactionHash)
 	if err != nil {
@@ -574,7 +607,12 @@ func (tb *TicketBuyer) signAndPublishTransaction(serializedTx []byte) (hash *cha
 	return
 }
 
-func (tb *TicketBuyer) sendPostRequest(marshalledJSON []byte) (*dcrjson.Response, error) {
+func (tb *TicketBuyer) sendPostRequest(cmd interface{}) (*dcrjson.Response, error) {
+	marshalledJSON, err := dcrjson.MarshalCmd(rpcVersion, 1, cmd)
+	if err != nil {
+		return nil, err
+	}
+
 	url := "https://127.0.0.1:19110"
 
 	bodyReader := bytes.NewReader(marshalledJSON)
