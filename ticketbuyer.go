@@ -8,10 +8,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-
 	"io/ioutil"
+	"math/rand"
 	"net"
 	"net/http"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -32,6 +33,16 @@ import (
 
 const (
 	generatedTxVersion uint16 = 1
+
+	mixedAccountName        = "mixed"
+	mixedAccount     uint32 = 0 // purchase account
+	unmixedAccount   uint32 = 1 // change account
+	votingAccount    uint32 = 2
+
+	jsonRPCServer    = "https://127.0.0.1:19110"
+	rpcUser          = "dcrwallet"
+	rpcPass          = "dcrwallet"
+	walletPassphrase = ""
 )
 
 var (
@@ -64,12 +75,12 @@ func (tb *TicketBuyer) connect() error {
 		return errors.New("connection exitss")
 	}
 
-	creds, err := credentials.NewClientTLSFromFile(tb.certificateFile, tb.host)
+	creds, err := credentials.NewClientTLSFromFile(tb.certificateFile, "localhost")
 	if err != nil {
 		return err
 	}
 
-	conn, err := grpc.Dial("localhost:19111", grpc.WithTransportCredentials(creds))
+	conn, err := grpc.Dial(tb.host, grpc.WithTransportCredentials(creds))
 	if err != nil {
 		return err
 	}
@@ -97,7 +108,7 @@ func (tb *TicketBuyer) printBalance() error {
 	ctx := context.Background()
 
 	balanceRequest := &pb.BalanceRequest{
-		AccountNumber:         0,
+		AccountNumber:         mixedAccount,
 		RequiredConfirmations: requiredConfirmations,
 	}
 	balanceResponse, err := tb.walletService.Balance(ctx, balanceRequest)
@@ -105,7 +116,7 @@ func (tb *TicketBuyer) printBalance() error {
 		return err
 	}
 	spendableBal := dcrutil.Amount(balanceResponse.Spendable)
-	fmt.Println("Spendable balance:", spendableBal)
+	fmt.Printf("Mixed account spendable balance: %s\n", spendableBal)
 	return nil
 }
 
@@ -196,10 +207,10 @@ func (tb *TicketBuyer) listenForBlockNotifications() error {
 	select {}
 }
 
-func (tb *TicketBuyer) generateAddress(internal bool) (address dcrutil.Address, pkScript []byte, err error) {
+func (tb *TicketBuyer) generateAddress(internal bool, accountNumber uint32) (address dcrutil.Address, pkScript []byte, err error) {
 	ctx := context.Background()
 	addressRequest := &pb.NextAddressRequest{
-		Account:   0,
+		Account:   accountNumber,
 		Kind:      pb.NextAddressRequest_BIP0044_EXTERNAL,
 		GapPolicy: pb.NextAddressRequest_GAP_POLICY_WRAP,
 	}
@@ -240,14 +251,14 @@ func (tb *TicketBuyer) purchaseTicket() error {
 		return err
 	}
 
-	votingAddress, _, err := tb.generateAddress(true)
+	votingAddress, _, err := tb.generateAddress(true, votingAccount)
 	if err != nil {
 		return err
 	}
 
 	estTxSize := estimateTicketSize(votingAddress)
 	ticketFee := txrules.FeeForSerializeSize(ticketFeeRelayDCR, estTxSize)
-	fmt.Printf("Ticket Fee: %s\n", ticketFee)
+	fmt.Printf("Ticket Price: %s, Ticket Fee: %s\n", ticketPrice, ticketFee)
 	totalTicketCost := ticketPrice + ticketFee
 
 	fundingTx, err := tb.sendFundingTx(totalTicketCost)
@@ -260,7 +271,7 @@ func (tb *TicketBuyer) purchaseTicket() error {
 	fundingOutputIndex := -1
 	for index, output := range fundingTx.TxOut {
 		if output.Value == int64(totalTicketCost) {
-			fmt.Printf("Output Value: %s, Cost Equal: %v\n", dcrutil.Amount(output.Value), output.Value == int64(totalTicketCost))
+			fmt.Printf("Found ticket sized output, Value: %s\n", dcrutil.Amount(output.Value))
 			fundingOutputIndex = index
 		}
 	}
@@ -276,7 +287,7 @@ func (tb *TicketBuyer) purchaseTicket() error {
 	txIn := wire.NewTxIn(txInOutpoint, int64(totalTicketCost), []byte{})
 	mtx.AddTxIn(txIn)
 
-	fmt.Printf("Value in: %s\n", dcrutil.Amount(txIn.ValueIn))
+	fmt.Printf("Total input: %s\n", dcrutil.Amount(txIn.ValueIn))
 
 	sstxPkScript, err := txscript.PayToSStx(votingAddress)
 	if err != nil {
@@ -285,9 +296,9 @@ func (tb *TicketBuyer) purchaseTicket() error {
 	sstxOut := wire.NewTxOut(int64(ticketPrice), sstxPkScript)
 	mtx.AddTxOut(sstxOut)
 
-	fmt.Printf("Value out: %s\n", dcrutil.Amount(sstxOut.Value))
+	fmt.Printf("Total output: %s\n", dcrutil.Amount(sstxOut.Value))
 
-	sstxCommitmentAddr, _, err := tb.generateAddress(true)
+	sstxCommitmentAddr, _, err := tb.generateAddress(true, unmixedAccount)
 	if err != nil {
 		return err
 	}
@@ -304,7 +315,7 @@ func (tb *TicketBuyer) purchaseTicket() error {
 	}
 	mtx.AddTxOut(sstxCommitmentTxOut)
 
-	sstxChangeAddr, _, err := tb.generateAddress(true)
+	sstxChangeAddr, _, err := tb.generateAddress(true, unmixedAccount)
 	if err != nil {
 		return err
 	}
@@ -336,7 +347,7 @@ func (tb *TicketBuyer) purchaseTicket() error {
 		return err
 	}
 
-	fmt.Printf("Tx Hash: %s", hash.String())
+	fmt.Printf("Tx Hash: %s\n", hash.String())
 
 	return nil
 }
@@ -372,17 +383,14 @@ func (tb *TicketBuyer) printUnspentOutputs() error {
 
 	fmt.Println("Unspent Outputs")
 	for _, unspentOutput := range unspentOutputs {
-		fmt.Printf("%s:%d Spendable: %t Amount: %f DCR\n", unspentOutput.TxID, unspentOutput.Vout, unspentOutput.Spendable, unspentOutput.Amount)
+		fmt.Printf("%s:%d Spendable: %t Account: %s, Amount: %f DCR\n", unspentOutput.TxID, unspentOutput.Vout,
+			unspentOutput.Spendable, unspentOutput.Account, unspentOutput.Amount)
 	}
 
 	return nil
 }
 
 func (tb *TicketBuyer) selectInputsForAmount(targetAmount dcrutil.Amount) (*txauthor.InputDetail, error) {
-	unspentOutputs, err := tb.listUnspentOutputs()
-	if err != nil {
-		return nil, err
-	}
 
 	var (
 		currentTotal      dcrutil.Amount
@@ -391,8 +399,18 @@ func (tb *TicketBuyer) selectInputsForAmount(targetAmount dcrutil.Amount) (*txau
 		redeemScriptSizes []int
 	)
 
+	unspentOutputs, err := tb.listUnspentOutputs()
+	if err != nil {
+		return nil, err
+	}
+
+	rand.Seed(time.Now().UnixNano())
+	rand.Shuffle(len(unspentOutputs), func(i, j int) {
+		unspentOutputs[i], unspentOutputs[j] = unspentOutputs[j], unspentOutputs[i]
+	})
+
 	for _, unspentOutput := range unspentOutputs {
-		if unspentOutput.Spendable {
+		if unspentOutput.Spendable && unspentOutput.Account == mixedAccountName {
 			unspentOutputAmount, err := dcrutil.NewAmount(unspentOutput.Amount)
 			if err != nil {
 				return nil, err
@@ -466,14 +484,14 @@ func (tb *TicketBuyer) sendFundingTx(ticketCost dcrutil.Amount) (*wire.MsgTx, er
 
 	mtx := wire.NewMsgTx()
 
-	_, outputScript, err := tb.generateAddress(true)
+	_, outputScript, err := tb.generateAddress(true, mixedAccount)
 	if err != nil {
 		return nil, err
 	}
 	txOut := wire.NewTxOut(int64(ticketCost), outputScript)
 	mtx.AddTxOut(txOut)
 
-	_, changeAddressScript, err := tb.generateAddress(true)
+	_, changeAddressScript, err := tb.generateAddress(true, unmixedAccount)
 	if err != nil {
 		return nil, err
 	}
@@ -531,12 +549,10 @@ func (tb *TicketBuyer) sendFundingTx(ticketCost dcrutil.Amount) (*wire.MsgTx, er
 			return nil, err
 		}
 
-		hash, err := tb.signAndPublishTransaction(serializedTx)
+		_, err = tb.signAndPublishTransaction(serializedTx)
 		if err != nil {
 			return nil, err
 		}
-
-		fmt.Printf("Published Funding Tx: %s\n", hash)
 
 		return mtx, nil
 	}
@@ -546,7 +562,7 @@ func (tb *TicketBuyer) sendFundingTx(ticketCost dcrutil.Amount) (*wire.MsgTx, er
 func (tb *TicketBuyer) signAndPublishTransaction(serializedTx []byte) (hash *chainhash.Hash, err error) {
 	ctx := context.Background()
 	signTransactionRequest := &pb.SignTransactionRequest{
-		Passphrase:            []byte("c"),
+		Passphrase:            []byte(walletPassphrase),
 		SerializedTransaction: serializedTx,
 	}
 
@@ -575,16 +591,14 @@ func (tb *TicketBuyer) signAndPublishTransaction(serializedTx []byte) (hash *cha
 }
 
 func (tb *TicketBuyer) sendPostRequest(marshalledJSON []byte) (*dcrjson.Response, error) {
-	url := "https://127.0.0.1:19110"
-
 	bodyReader := bytes.NewReader(marshalledJSON)
-	req, err := http.NewRequest("POST", url, bodyReader)
+	req, err := http.NewRequest("POST", jsonRPCServer, bodyReader)
 	if err != nil {
 		return nil, err
 	}
 	req.Close = true
 	req.Header.Set("Content-Type", "application/json")
-	req.SetBasicAuth("dcrwallet", "dcrwallet")
+	req.SetBasicAuth(rpcUser, rpcPass)
 
 	client, err := tb.newHTTPClient()
 	if err != nil {

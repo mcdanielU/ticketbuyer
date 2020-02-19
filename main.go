@@ -13,18 +13,18 @@ const (
 	// fee limits imposed on a ticket.
 	defaultTicketFeeLimits = 0x5800
 
-	numTickets            = 1
 	defaultExpiry         = int32(0)
 	requiredConfirmations = 0
 	accountNumber         = 0 // default account
 	rpcVersion            = "1.0"
+	grpcServer            = "localhost:19111"
 )
 
 func main() {
 
-	certificateFile := filepath.Join(dcrutil.AppDataDir("dcrwallet", false), "rpc.cert")
+	certificateFile := filepath.Join(dcrutil.AppDataDir(rpcUser, false), "rpc.cert")
 
-	tb := NewTicketBuyer("localhost", certificateFile, chaincfg.TestNet3Params())
+	tb := NewTicketBuyer(grpcServer, certificateFile, chaincfg.TestNet3Params())
 
 	err := tb.connect()
 	if err != nil {
